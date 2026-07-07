@@ -426,11 +426,90 @@ curl -s -X DELETE \
 
 ---
 
-## 11. Notes / production hardening
+## 11. Second resource: GitHub via Okta STS (SDK variant)
 
-- `_token_store` is a **shared module-level singleton** (see `cloudshell_adk_idjag.py`
-  header) — fine for single-user prototype testing; replace with a `ContextVar` for
-  multi-user isolation before production.
+`cloudshell_adk_idjag_sdk.py` is a variant that (a) runs the Smart Triage ID-JAG
+exchange through Okta's **`okta-client-python`** SDK (`CrossAppAccessFlow`) instead
+of hand-rolled httpx, and (b) adds a **second resource connection — the GitHub MCP —
+via the Okta STS / brokered-consent flow**. Both resources are connected to the same
+AI agent (`wlp10mv0rrvI9zG9M1d8`) in Okta and both exchanges start from the same
+Agentspace access token.
+
+> The manual variant `cloudshell_adk_idjag.py` is Smart Triage only. Deploy the SDK
+> variant as a separate Agent Engine ("Jo direct ID-JAG + GitHub STS agent (SDK)").
+
+### GitHub STS flow (single RFC 8693 exchange)
+
+Unlike ID-JAG's two steps, GitHub is one token exchange (SDK `TokenExchangeFlow`)
+at the Org AS `{ORG}/oauth2/v1/token`:
+
+```
+grant_type            = urn:ietf:params:oauth:grant-type:token-exchange
+requested_token_type  = urn:okta:params:oauth:token-type:oauth-sts
+subject_token         = <Agentspace access token>
+subject_token_type    = urn:ietf:params:oauth:token-type:access_token
+client_assertion_type = urn:ietf:params:oauth:client-assertion-type:jwt-bearer
+client_assertion      = <private_key_jwt, aud = this token endpoint>   (SDK key_provider-signed)
+resource              = <GITHUB_RESOURCE_ORN>                          (Okta ORN, not the API URL)
+```
+
+- **200** → `access_token` → cached in a **second store** and used as `Bearer` to the
+  GitHub MCP (`GITHUB_MCP_URL`).
+- **400 `interaction_required`** (brokered consent not yet granted) →
+  ```json
+  { "error": "interaction_required", "interaction_uri": "https://.../oauth2/v1/sts/redirect?dataHandle=..." }
+  ```
+  The agent captures `interaction_uri` and the instruction provider appends an
+  "🔐 Authorize GitHub →" directive, so the model renders it as a clickable consent
+  link and waits. After the user consents, the same exchange returns `200` + token.
+
+The GitHub MCP toolset tolerates a pre-consent `401` on `tools/list` (returns no
+tools until authorized) so Smart Triage still works; GitHub tools light up once a
+token is cached.
+
+### Extra `.env` keys (add to the base 8)
+
+```
+GITHUB_MCP_URL=https://api.githubcopilot.com/mcp
+GITHUB_RESOURCE_ORN=orn:oktapreview:idp:github
+# Optional — only if the SDK derives the wrong Org-AS token URL:
+# OKTA_ORG_ISSUER=https://itpoktane24.oktapreview.com/oauth2/v1
+```
+
+### Deps (SDK variant)
+
+```bash
+pip install --user google-adk==1.33.0 "google-cloud-aiplatform[adk,reasoningengine]" \
+  mcp httpx okta-client-python cryptography python-dotenv
+python cloudshell_adk_idjag_sdk.py
+```
+
+### Verify (logs use the `[idjag-sdk]` prefix)
+
+```bash
+gcloud logging read \
+  'resource.type="aiplatform.googleapis.com/ReasoningEngine" AND textPayload:"[idjag-sdk]"' \
+  --project=jo-dev-portal --freshness=15m --limit=40 \
+  --format='value(timestamp,textPayload)' --order=asc
+```
+
+- Smart Triage: `CrossAppAccessFlow.start()` → `resume()` → resource token cached.
+- GitHub: `GitHub STS access_token -> oauth-sts` → `GitHub STS response`; on
+  `interaction_required` the `interaction_uri` is logged and injected into the prompt.
+- `dump_state` reports `github_token_cached` and `github_interaction_uri`.
+
+If GitHub STS returns `invalid_target` / `invalid_resource`, the `GITHUB_RESOURCE_ORN`
+value is wrong for the `resource` param — fix it to what Okta expects.
+
+---
+
+## 12. Notes / production hardening
+
+- The token stores (`_token_store`, and `_gh_token_store` in the SDK variant) are
+  **shared module-level singletons** — fine for single-user prototype testing;
+  replace with `ContextVar`s for multi-user isolation before production. Note this
+  also means GitHub tools only appear on a worker whose store already holds a token,
+  so after first consent a fresh chat/turn may be needed for them to show.
 - Remove the `dump_state` diagnostic tool (and the `[idjag]` verbose traces) before
   production.
 - Rotate the RSA private key after prototyping; keep it only in the git-ignored `.env` /
