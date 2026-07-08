@@ -8,18 +8,18 @@ Agentspace access token (subject_token_type = access_token):
   1. Smart Triage  — Cross-App Access / ID-JAG, via CrossAppAccessFlow
                      (start() = access_token->ID-JAG, resume() = ID-JAG->resource token).
   2. GitHub MCP    — Okta STS / brokered consent, a single RFC 8693 token exchange
-                     (requested_token_type = urn:okta:params:oauth:token-type:oauth-sts),
-                     via the SDK's TokenExchangeFlow. On interaction_required the SDK
-                     raises an OAuth2Error that DROPS Okta's non-standard interaction_uri
-                     (CONFIRMED 2026-07-07, SDK 0.2.0: OAuth2Error has no field for it), so
-                     an APIClientListener (did_send) grabs it from the raw response body
-                     before exchange() discards it — see _StsInteractionListener.
+                     (requested_token_type = urn:okta:params:oauth:token-type:oauth-sts).
+                     Done with manual httpx: CONFIRMED (2026-07-07) that the SDK's
+                     TokenExchangeFlow parses the error to OAuth2Error keeping only
+                     error/error_description and DROPS Okta's non-standard interaction_uri
+                     (additional_fields = {}). Manual httpx reads the full JSON body so we
+                     can surface that sts/redirect consent link to the user.
 
 Each resource gets its own token store and its own MCP toolset (own Bearer header).
 
 GitHub consent (brokered): if the STS exchange signals interaction_required, the
-interaction_uri (https://.../v1/sts/redirect?...) is captured by _StsInteractionListener
-from the transport-level response; the instruction provider surfaces it as a clickable
+interaction_uri (https://.../v1/sts/redirect?...) is pulled from
+OAuth2Error.additional_fields; the instruction provider surfaces it as a clickable
 "Authorize GitHub" link and waits. Once consent exists the same exchange returns the
 GitHub access_token used as Bearer to the GitHub MCP.
 
@@ -29,21 +29,20 @@ Integration notes (verify on first redeploy)
 ---------------------------------------------
 * Async bridge: the SDK is async but ADK calls our hooks synchronously inside a
   running loop, so SDK coroutines run in a fresh thread (see _run_async).
-* PEM: LocalKeyProvider signs the private_key_jwt client assertion for the SDK — now
-  for BOTH Smart Triage (ID-JAG) and GitHub (STS), via the shared _org_oauth_client().
+* PEM: LocalKeyProvider loads the key for the SDK (Smart Triage); the GitHub STS
+  client assertion is signed with PyJWT (sync).
 * Org-AS issuer/client for the SDK is built by _org_oauth_client() (OKTA_ORG_ISSUER,
-  default OKTA_DOMAIN); both the ID-JAG and STS exchanges post to its token endpoint.
+  default OKTA_DOMAIN); GitHub httpx posts directly to {ORG}/oauth2/v1/token.
 * GitHub tools/list tolerates 401 pre-consent (returns no tools until authorized).
 
 Prerequisites
 -------------
     pip install google-adk google-cloud-aiplatform[adk,reasoningengine] \
-        mcp okta-client-python cryptography python-dotenv
+        mcp httpx okta-client-python cryptography pyjwt python-dotenv
 """
 
 import asyncio
 import base64
-import contextvars
 import json
 import os
 import re
@@ -51,8 +50,11 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from typing import Any, Optional
 
+import httpx
+import jwt as pyjwt
 from dotenv import load_dotenv
 import vertexai
 from google.adk.agents.llm_agent import LlmAgent
@@ -70,13 +72,7 @@ from okta_client.authfoundation import (
 )
 from okta_client.authfoundation.oauth2.jwt_bearer_claims import JWTBearerClaims
 from okta_client.authfoundation.oauth2.client_authorization import ClientAssertionAuthorization
-from okta_client.authfoundation.networking import APIClientListener, APIRetry
-from okta_client.oauth2auth import (
-    CrossAppAccessFlow,
-    CrossAppAccessTarget,
-    TokenExchangeFlow,
-    TokenType,
-)
+from okta_client.oauth2auth import CrossAppAccessFlow, CrossAppAccessTarget
 
 load_dotenv()
 
@@ -184,7 +180,7 @@ class SanitizingMcpToolset(McpToolset):
 class TolerantGitHubMcpToolset(SanitizingMcpToolset):
     """GitHub MCP toolset that tolerates a pre-consent 401 on tools/list: returns
     no tools until the user authorizes (so Smart Triage still loads). GitHub tools
-    appear on a later session once the user's GitHub store holds a token."""
+    appear on a later session once _gh_token_store holds a token."""
 
     async def get_tools(self, *args, **kwargs):
         try:
@@ -239,6 +235,28 @@ def _decode_jwt_noverify(token: str) -> dict:
         return json.loads(base64.urlsafe_b64decode(seg).decode())
     except Exception:
         return {}
+
+
+def _make_agent_assertion(token_endpoint: str) -> str:
+    """private_key_jwt client assertion (PyJWT, sync) for the manual GitHub STS
+    exchange. iss=sub=AT_AI_AGENT_ID, aud=<token endpoint>, 5-min exp, RS256.
+    (Smart Triage's assertion is handled by the SDK's key_provider.)"""
+    now = int(time.time())
+    agent_id = _cfg("AT_AI_AGENT_ID")
+    payload = {
+        "iss": agent_id,
+        "sub": agent_id,
+        "aud": token_endpoint,
+        "iat": now,
+        "exp": now + 300,
+        "jti": str(uuid.uuid4()),
+    }
+    return pyjwt.encode(
+        payload,
+        _private_key_pem(),
+        algorithm="RS256",
+        headers={"kid": _cfg("AT_AGENT_PRIVATE_KEY_ID"), "typ": "jwt"},
+    )
 
 
 # ── Trace logging ────────────────────────────────────────────────────────────
@@ -403,54 +421,18 @@ def _resolve_exp(token: str, expires_in: Any) -> int:
     return int(time.time()) + 3600
 
 
-# ── GitHub: Okta STS / brokered consent (SDK TokenExchangeFlow + listener) ─────
+# ── GitHub: Okta STS / brokered consent (manual httpx exchange) ────────────────
 #
-# Uses the SDK's TokenExchangeFlow (same client as Smart Triage's ID-JAG). One
-# wrinkle: on interaction_required, OAuth2Client.exchange() collapses the response
-# body into an OAuth2Error that keeps only error/error_description/error_uri and
-# DROPS Okta's non-standard `interaction_uri` (CONFIRMED SDK 0.2.0 — OAuth2Error has
-# no field for it). But the transport (DefaultNetworkInterface) returns the 4xx body
-# as a RawResponse WITHOUT raising, so APIClient.send() parses the full JSON and
-# fires the listener's did_send() with it *before* exchange() raises. An
-# APIClientListener therefore recovers interaction_uri from response.result — no
-# manual httpx needed.
-
-_OAUTH_STS_TOKEN_TYPE = "urn:okta:params:oauth:token-type:oauth-sts"
-
-
-class _StsInteractionListener(APIClientListener):
-    """Captures Okta's `interaction_uri` from the STS token-exchange response body
-    at the transport layer (did_send), before the SDK collapses the body into an
-    OAuth2Error that drops it. One instance per exchange (fresh client per call)."""
-
-    def __init__(self) -> None:
-        self.interaction_uri = ""
-
-    def will_send(self, client, request) -> None:
-        pass
-
-    def did_send(self, client, request, response) -> None:
-        result = getattr(response, "result", None)
-        uri = (
-            result.get("interaction_uri") if isinstance(result, dict)
-            else getattr(result, "interaction_uri", None)
-        )
-        if uri:
-            self.interaction_uri = uri
-
-    def did_send_error(self, client, request, error) -> None:
-        pass
-
-    def should_retry(self, client, request, rate_limit) -> APIRetry:
-        return APIRetry.default()
-
+# Manual httpx (not the SDK TokenExchangeFlow): CONFIRMED on 2026-07-07 that the SDK
+# parses the token-exchange error into OAuth2Error keeping only error/error_description
+# and DROPS Okta's non-standard `interaction_uri` (additional_fields came back {}).
+# We need that sts/redirect consent URL, so we read the full JSON body ourselves.
 
 def _exchange_github_sts(user_access_token: str) -> tuple[str, int, str]:
-    """Single Okta STS token exchange for the GitHub MCP resource, via the SDK's
-    TokenExchangeFlow (requested_token_type = oauth-sts, resource = GITHUB_RESOURCE_ORN).
+    """Single Okta STS token exchange for the GitHub MCP resource.
 
     Returns (access_token, exp_epoch, interaction_uri):
-      * success + access_token    -> (token, exp, "")            consent already granted
+      * 200 + access_token        -> (token, exp, "")            consent already granted
       * interaction_required      -> ("", 0, interaction_uri)    user must consent
       * anything else / error     -> ("", 0, "")
     """
@@ -461,52 +443,47 @@ def _exchange_github_sts(user_access_token: str) -> tuple[str, int, str]:
                   status="skip")
         return "", 0, ""
 
-    listener = _StsInteractionListener()
-    _log_step("GitHub STS access_token -> oauth-sts via TokenExchangeFlow.start() (SDK)",
-              req={"resource": orn, "requested_token_type": _OAUTH_STS_TOKEN_TYPE})
-
-    async def _flow():
-        client = _org_oauth_client()
-        client.listeners.add(listener)   # capture interaction_uri before exchange() drops it
-        flow = TokenExchangeFlow(client=client)
-        return await flow.start(
-            subject_token=user_access_token,
-            subject_token_type=TokenType.ACCESS_TOKEN,
-            resource=[orn],
-            requested_token_type=_OAUTH_STS_TOKEN_TYPE,
-        )
+    token_ep = f"{okta}/oauth2/v1/token"
+    payload = {
+        "grant_type":            "urn:ietf:params:oauth:grant-type:token-exchange",
+        "requested_token_type":  "urn:okta:params:oauth:token-type:oauth-sts",
+        "subject_token":         user_access_token,
+        "subject_token_type":    "urn:ietf:params:oauth:token-type:access_token",
+        "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+        "client_assertion":      _make_agent_assertion(token_ep),
+        "resource":              orn,
+    }
+    _log_step(f"GitHub STS access_token -> oauth-sts (POST {token_ep})", req=payload)
+    try:
+        r = httpx.post(token_ep, data=payload, timeout=30)
+    except Exception as exc:
+        _log_step("GitHub STS request error", status="ERR", resp=str(exc))
+        return "", 0, ""
 
     try:
-        token = _run_async(_flow)
-    except Exception as exc:
-        # interaction_required (brokered consent) surfaces here as OAuth2Error; the
-        # listener already grabbed Okta's interaction_uri from the raw 4xx body.
-        if listener.interaction_uri:
-            _log_step("GitHub STS interaction_required (brokered consent)", status="consent",
-                      resp={"interaction_uri": listener.interaction_uri})
-            return "", 0, listener.interaction_uri
-        _log_step("GitHub STS exchange failed", status="ERR", resp=repr(exc))
-        return "", 0, ""
+        body = r.json()
+        body = body if isinstance(body, dict) else {}
+    except Exception:
+        body = {}
+    _log_step("GitHub STS response", status=r.status_code, resp=(body or r.text))
 
-    access_token = getattr(token, "access_token", "") or ""
-    if not access_token:
-        _log_step("GitHub STS returned no access_token", status="ERR", resp=repr(token))
-        return "", 0, ""
+    if r.status_code == 200 and body.get("access_token"):
+        tok = body["access_token"]
+        return tok, _resolve_exp(tok, body.get("expires_in")), ""
 
-    exp = _resolve_exp(access_token, getattr(token, "expires_in", None))
-    _log_step(f"GitHub STS ok: token cached (exp={exp}) -> Bearer to GitHub MCP")
-    return access_token, exp, ""
+    if body.get("error") == "interaction_required" and body.get("interaction_uri"):
+        _log_step("GitHub STS interaction_required (brokered consent)", status="consent",
+                  resp={"interaction_uri": body["interaction_uri"]})
+        return "", 0, body["interaction_uri"]
+
+    return "", 0, ""
 
 
-# ── Per-user token stores + per-request injection ──────────────────────────────
+# ── Token stores + per-request injection ───────────────────────────────────────
 #
-# Token stores are keyed by subject (the Agentspace end-user's session user_id) so a
-# warm worker never serves one user's — or a stale — token to another, and a
-# not-yet-consented user actually triggers the GitHub consent exchange instead of
-# inheriting a cached one. The connection-params `headers` property has no request
-# context, so the current subject is carried in a ContextVar set at the request
-# entrypoint and in the instruction / before-tool hooks, and read when injecting the
-# Bearer. _TokenStore.__reduce__ serializes empty; the worker re-populates per request.
+# Two stores (Smart Triage resource token, GitHub STS token). Plain mutable objects
+# (ContextVar is unpicklable); __reduce__ serializes them empty and the worker
+# re-populates per request. Shared module-level state — prototype scope.
 
 class _TokenStore:
     def __init__(self):
@@ -527,162 +504,68 @@ class _TokenStore:
         return (self.__class__, ())
 
 
-_token_stores: dict = {}       # Smart Triage resource tokens, keyed by subject
-_gh_token_stores: dict = {}    # GitHub STS tokens, keyed by subject
-_gh_states: dict = {}          # per subject: {"interaction_uri": <last GitHub consent URL>}
-_auth_diags: dict = {}         # dump_state diagnostics, keyed by subject
-_last_subject: dict = {"value": ""}  # most-recent identified subject; header fallback for when the
-                                     # ContextVar doesn't reach the MCP header read (see _bearer)
+_token_store = _TokenStore()       # Smart Triage resource token
+_gh_token_store = _TokenStore()    # GitHub STS token
+_gh_state: dict = {"interaction_uri": ""}   # last GitHub consent URL (if any)
 
-# Current request's subject, read by the connection-params `headers` property (which
-# has no request context). Set at the request entrypoint and the instruction /
-# before-tool hooks, all of which run within the request's task/context.
-#
-# The ContextVar is created LAZILY on the worker (same pattern as _key_provider_cache):
-# a module-level ContextVar gets captured by cloudpickle when the agent is serialized
-# for deployment and fails with "cannot pickle ContextVar". This cache dict is empty at
-# pickle time, so it serializes fine, and the worker builds the ContextVar on first use.
-_ctx_cache: dict = {}
-
-
-def _subj_var() -> "contextvars.ContextVar":
-    v = _ctx_cache.get("subject")
-    if v is None:
-        v = contextvars.ContextVar("idjag_subject", default="")
-        _ctx_cache["subject"] = v
-    return v
+# Diagnostic surfaced by dump_state (populated in the instruction-provider context
+# where the Agentspace token is present).
+_auth_diag: dict = {
+    "agentspace_token_received": False,
+    "matched_key": None,
+    "subject_claims": {},
+    "smarttriage_token_cached": False,
+    "github_token_cached": False,
+    "github_interaction_required": False,
+    "github_interaction_uri": "",
+}
 
 
-def _new_diag() -> dict:
-    return {
-        "subject": "",
-        "agentspace_token_received": False,
-        "matched_key": None,
-        "subject_claims": {},
-        "smarttriage_token_cached": False,
-        "github_token_cached": False,
-        "github_interaction_required": False,
-        "github_interaction_uri": "",
-    }
-
-
-def _store_for(stores: dict, subject: str) -> "_TokenStore":
-    st = stores.get(subject)
-    if st is None:
-        st = _TokenStore()
-        stores[subject] = st
-    return st
-
-
-def _diag_for(subject: str) -> dict:
-    d = _auth_diags.get(subject)
-    if d is None:
-        d = _new_diag()
-        _auth_diags[subject] = d
-    return d
-
-
-def _gh_state_for(subject: str) -> dict:
-    s = _gh_states.get(subject)
-    if s is None:
-        s = {"interaction_uri": ""}
-        _gh_states[subject] = s
-    return s
-
-
-def _subject_key(session: Any, access_token: str = "") -> str:
-    """Stable per-user key. Prefers the session user_id (present in both the
-    instruction context and the tool context); falls back to the access token's
-    sub/uid claim when the session has none. Returns "" when unidentifiable."""
-    uid = str(getattr(session, "user_id", "") or "")
-    if uid:
-        return uid
-    claims = _decode_jwt_noverify(access_token) if access_token else {}
-    return str(claims.get("sub") or claims.get("uid") or "")
-
-
-def _bearer(stores: dict, label: str = "MCP") -> dict:
-    """Authorization header for the current request's subject. Resolves the subject
-    from the ContextVar; if that hasn't propagated to this MCP header read (ADK may run
-    tools/list in a different context than the hook that set it), falls back to the
-    most-recently-identified subject so the just-active user's token is still injected.
-    Logs a miss so the deploy logs reveal whether the ContextVar actually propagated."""
-    cv = _subj_var().get()
-    subject = cv or _last_subject["value"]
-    store = stores.get(subject)
-    token = store.get() if store else ""
-    if not token:
-        print(f"[idjag-sdk] {label} bearer: NO token "
-              f"(cv={cv!r} fallback={_last_subject['value']!r} known={list(stores.keys())})",
-              file=sys.stderr, flush=True)
-    else:
-        print(f"[idjag-sdk] {label} bearer: token injected "
-              f"(subject={subject!r}, via={'cv' if cv else 'fallback'})",
-              file=sys.stderr, flush=True)
-    return {"Authorization": f"Bearer {token}"} if token else {}
-
-
-def _ensure_resource_token(state: Any, subject: str) -> None:
-    """Smart Triage ID-JAG exchange (SDK) → subject's store, when empty/expired."""
-    store = _store_for(_token_stores, subject)
-    if store.valid():
+def _ensure_resource_token(state: Any) -> None:
+    """Smart Triage ID-JAG exchange (SDK) → _token_store, when cache empty/expired."""
+    if _token_store.valid():
         return
     access_token, _ = _find_token(state)
     if not access_token:
         return
     token, exp = _exchange_for_resource_token(access_token)
     if token:
-        store.set(token, exp)
-        _diag_for(subject)["smarttriage_token_cached"] = True
+        _token_store.set(token, exp)
+        _auth_diag["smarttriage_token_cached"] = True
 
 
-def _ensure_github_token(state: Any, subject: str) -> None:
-    """GitHub STS exchange (SDK) → subject's store, or capture the consent
+def _ensure_github_token(state: Any) -> None:
+    """GitHub STS exchange (httpx) → _gh_token_store, or capture the consent
     interaction_uri when brokered consent is required."""
-    store = _store_for(_gh_token_stores, subject)
-    if store.valid():
+    if _gh_token_store.valid():
         return
     access_token, _ = _find_token(state)
     if not access_token:
         return
     token, exp, interaction_uri = _exchange_github_sts(access_token)
-    gh_state = _gh_state_for(subject)
-    diag = _diag_for(subject)
     if token:
-        store.set(token, exp)
-        gh_state["interaction_uri"] = ""
-        diag.update(github_token_cached=True,
-                    github_interaction_required=False, github_interaction_uri="")
+        _gh_token_store.set(token, exp)
+        _gh_state["interaction_uri"] = ""
+        _auth_diag.update(github_token_cached=True,
+                          github_interaction_required=False, github_interaction_uri="")
     elif interaction_uri:
-        gh_state["interaction_uri"] = interaction_uri
-        diag.update(github_token_cached=False,
-                    github_interaction_required=True, github_interaction_uri=interaction_uri)
+        _gh_state["interaction_uri"] = interaction_uri
+        _auth_diag.update(github_token_cached=False,
+                          github_interaction_required=True, github_interaction_uri=interaction_uri)
 
 
-def _ensure_tokens(state: Any, subject: str) -> None:
-    """Record the incoming Agentspace token for `subject`, then run both resource
-    exchanges into that subject's stores. Failures in one resource never block the
-    other. `subject` is the per-user key (see _subject_key)."""
-    diag = _diag_for(subject)
+def _ensure_tokens(state: Any) -> None:
+    """Record the incoming Agentspace token, then run both resource exchanges.
+    Failures in one resource never block the other."""
     access_token, matched_key = _find_token(state)
     if not access_token:
-        # Don't clobber diag for a subject whose tokens are already established: the
-        # Agentspace token appears in session.state at instruction time but not in
-        # tool_context.state at tool-call time, so this path legitimately sees none.
-        st = _token_stores.get(subject)
-        gh = _gh_token_stores.get(subject)
-        if not ((st and st.valid()) or (gh and gh.valid())):
-            diag.update(agentspace_token_received=False, matched_key=None, subject_claims={})
-        print(f"[idjag-sdk] no access token in state for subject={subject!r} "
-              f"matching prefix={AUTH_ID_PREFIX!r}", file=sys.stderr, flush=True)
+        _auth_diag.update(agentspace_token_received=False, matched_key=None, subject_claims={})
+        print(f"[idjag-sdk] no access token in state matching prefix={AUTH_ID_PREFIX!r}",
+              file=sys.stderr, flush=True)
         return
 
-    if subject:
-        _last_subject["value"] = subject   # header fallback when the ContextVar doesn't propagate
-
     _claims = _decode_jwt_noverify(access_token)
-    diag.update(
-        subject=subject,
+    _auth_diag.update(
         agentspace_token_received=True,
         matched_key=matched_key,
         subject_claims={k: _claims.get(k) for k in ("iss", "aud", "exp", "cid", "scp")},
@@ -690,16 +573,15 @@ def _ensure_tokens(state: Any, subject: str) -> None:
 
     for name, fn in (("SmartTriage", _ensure_resource_token), ("GitHub", _ensure_github_token)):
         try:
-            fn(state, subject)
+            fn(state)
         except Exception as exc:
-            print(f"[idjag-sdk] {name} token ensure failed (subject={subject!r}): {exc}",
-                  file=sys.stderr, flush=True)
+            print(f"[idjag-sdk] {name} token ensure failed: {exc}", file=sys.stderr, flush=True)
 
 
 # ── Dynamic connection params (one per resource, own Bearer header) ────────────
 
 class DynamicStreamableHTTPConnectionParams(StreamableHTTPConnectionParams):
-    """Smart Triage MCP params — Bearer from the current subject's store."""
+    """Smart Triage MCP params — Bearer from _token_store."""
 
     def __reduce__(self):
         return (_make_st_params, (self.url, self.timeout))
@@ -710,13 +592,15 @@ def _make_st_params(url: str, timeout: float) -> "DynamicStreamableHTTPConnectio
 
 
 DynamicStreamableHTTPConnectionParams.headers = property(  # type: ignore[assignment]
-    lambda self: _bearer(_token_stores, "SmartTriage"),
+    lambda self: (
+        {"Authorization": f"Bearer {_token_store.get()}"} if _token_store.get() else {}
+    ),
     lambda self, v: None,
 )
 
 
 class GitHubStreamableHTTPConnectionParams(StreamableHTTPConnectionParams):
-    """GitHub MCP params — Bearer from the current subject's store."""
+    """GitHub MCP params — Bearer from _gh_token_store."""
 
     def __reduce__(self):
         return (_make_github_params, (self.url, self.timeout))
@@ -727,7 +611,9 @@ def _make_github_params(url: str, timeout: float) -> "GitHubStreamableHTTPConnec
 
 
 GitHubStreamableHTTPConnectionParams.headers = property(  # type: ignore[assignment]
-    lambda self: _bearer(_gh_token_stores, "GitHub"),
+    lambda self: (
+        {"Authorization": f"Bearer {_gh_token_store.get()}"} if _gh_token_store.get() else {}
+    ),
     lambda self, v: None,
 )
 
@@ -739,16 +625,9 @@ def _inject_credential(
     args: dict,
     tool_context: ToolContext,
 ) -> Optional[dict]:
-    """Refresh both resource tokens for the current user before each tool call, and
-    pin the subject in the ContextVar so the MCP Bearer header resolves to this user's
-    store. Returns None so the tool proceeds (GitHub consent is surfaced via the
-    instruction provider)."""
-    state = tool_context.state
-    access_token, _ = _find_token(state)
-    subject = _subject_key(getattr(tool_context, "session", None), access_token or "")
-    if subject:
-        _subj_var().set(subject)   # don't clobber a good value with "" (unidentified)
-    _ensure_tokens(state, subject)
+    """Refresh both resource tokens before each tool call. Returns None so the
+    tool proceeds (GitHub consent is surfaced via the instruction provider)."""
+    _ensure_tokens(tool_context.state)
     return None
 
 
@@ -780,24 +659,15 @@ def dump_state(tool_context: ToolContext) -> dict:
         for k, v in state_dict.items()
     }
 
-    subject = _subj_var().get() or _subject_key(getattr(tool_context, "session", None))
-    diag = _auth_diags.get(subject, _new_diag())
-    st_store = _token_stores.get(subject)
-    gh_store = _gh_token_stores.get(subject)
-    gh_state = _gh_states.get(subject, {})
-
-    print(f"[idjag-sdk][DIAG] subject={subject!r} tool_context.state keys: {state_keys}",
-          file=sys.stderr, flush=True)
-    print(f"[idjag-sdk][DIAG] agentspace_auth: {diag}", file=sys.stderr, flush=True)
+    print(f"[idjag-sdk][DIAG] tool_context.state keys: {state_keys}", file=sys.stderr, flush=True)
+    print(f"[idjag-sdk][DIAG] agentspace_auth: {_auth_diag}", file=sys.stderr, flush=True)
     return {
-        "current_subject": subject,
-        "known_subjects": list(_auth_diags.keys()),
         "state_keys": state_keys,
         "state_redacted": safe_state,
-        "agentspace_auth": diag,
-        "smarttriage_token_cached": bool(st_store and st_store.valid()),
-        "github_token_cached": bool(gh_store and gh_store.valid()),
-        "github_interaction_uri": gh_state.get("interaction_uri", ""),
+        "agentspace_auth": _auth_diag,
+        "smarttriage_token_cached": _token_store.valid(),
+        "github_token_cached": _gh_token_store.valid(),
+        "github_interaction_uri": _gh_state.get("interaction_uri", ""),
         "user_id": getattr(tool_context.session, "user_id", None),
         "session_id": getattr(tool_context.session, "id", None),
     }
@@ -848,20 +718,14 @@ def _instruction_provider(context: ReadonlyContext) -> str:
         state_keys = list(state.keys())
     except Exception:
         state_keys = list(_as_dict(state).keys())
-
-    access_token, _ = _find_token(state)
-    subject = _subject_key(context.session, access_token or "")
-    if subject:
-        _subj_var().set(subject)
-    print(f"[idjag-sdk] instruction_provider subject={subject!r} session_state keys: {state_keys}",
+    print(f"[idjag-sdk] instruction_provider session_state keys: {state_keys}",
           file=sys.stderr, flush=True)
 
-    _ensure_tokens(state, subject)
+    _ensure_tokens(state)
 
     instruction = _BASE_INSTRUCTION
-    consent_uri = _gh_states.get(subject, {}).get("interaction_uri", "")
-    gh_store = _gh_token_stores.get(subject)
-    if consent_uri and not (gh_store and gh_store.valid()):
+    consent_uri = _gh_state.get("interaction_uri", "")
+    if consent_uri and not _gh_token_store.valid():
         instruction += _GITHUB_CONSENT_TEMPLATE.format(uri=consent_uri)
     return instruction
 
@@ -902,11 +766,8 @@ class EnterpriseAdkApp(AdkApp):
         super().__init__(**(kwargs or {"agent": _build_agent(), "enable_tracing": True}))
 
     def streaming_agent_run_with_events(self, **kwargs):
-        """Pin the request's subject in the ContextVar (so the MCP Bearer resolves to
-        this user's store), sanitize Agentspace session paths, then delegate to parent."""
+        """Sanitize Agentspace session paths, then delegate to parent."""
         user_id = kwargs.get("user_id", "") or ""
-        if user_id:
-            _subj_var().set(user_id)   # set at the entrypoint; child tasks inherit it
         print(f"[idjag-sdk] streaming_agent_run_with_events user_id={user_id!r}",
               file=sys.stderr, flush=True)
 
@@ -952,11 +813,13 @@ if __name__ == "__main__":
             "google-adk==1.33.0",
             "google-cloud-aiplatform[adk,reasoningengine]",
             "mcp",
+            "httpx",
             "okta-client-python",
+            "pyjwt",
             "cryptography",
         ],
         env_vars=_build_env_vars(),
-        display_name="ADKAgent_OktaPythonSDK",
+        display_name="Jo direct ID-JAG + GitHub STS agent (SDK)",
     )
 
     print("Done! Resource name:", remote_app.resource_name)
